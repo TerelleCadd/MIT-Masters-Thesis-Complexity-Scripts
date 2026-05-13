@@ -1,0 +1,1334 @@
+    % =========================================================================
+    % Script Name: DSMParseV3.m
+    % Author: Terelle Cadd (updated integration wiring)
+    % Date: 02/24/2026
+    %
+    % Description:
+    % DSM parsing + multiplicity expansion + interface counting, integrated
+    % with a performance model call (butte_county_fire_v3.m as a FUNCTION).
+    %
+    % NEW (02/24/2026):
+    % - Reads suppression time interval between uses (days) from Column CK
+    % - Shows cycle_days in the GUI
+    % - Replicates cycle_days with multiplicity
+    % - Writes cycle_days into the interface counts output table
+    % - Passes expandedCycleDays into performance model via resources struct
+    %
+    % UPDATED:
+    % - Integrates STK observation metrics for EO / Weather / AllSat
+    % - Computes:
+    %       EO_MinObsGap_hr
+    %       EO_MaxObsGap_hr
+    %       Weather_MinObsGap_hr
+    %       AllSat_MinObsGap_hr
+    %       AllSat_MaxObsGap_hr
+    % - Writes those metrics into the performance summary output
+    %
+    % - Runs ONE full nominal/base case with normal figures
+    % - Then runs delay analysis in FAST MODE only
+    %   (no repeated screenshot prompt, no repeated animation)
+    % - Produces one combined burn area vs time comparison plot
+    % =========================================================================
+    
+    clc; clear; close all;
+    
+    %% === INPUT SETTINGS ===
+    inputFile    = 'SOS DSM.xlsx';
+    inputSheet   = 'DSM';
+    outputDSM    = 'Expanded_DSM_Matrix.xlsx';
+    outputCount  = 'DSM_Interface_Counts.xlsx';
+    outputSheet  = 'Counts';
+    
+    %% Hierarchy plot toggle
+    doPlotHierarchy = false;
+    
+    %% === PERFORMANCE INTEGRATION TOGGLES ===
+    doRunPerformance = true;
+    perfOutXlsx      = 'Performance_Output.xlsx';
+    perfOutSheet     = 'ScenarioOutput';
+    
+    % Performance config (scenario-specific values will be assigned
+    % AFTER GUI selection using selectedScenario)
+    perfCfg = struct();
+    perfCfg.apiKey   = "AIzaSyAa0XVcBBcwfoyCKJrMgobmV2lrAcbZYDc";
+    
+    % Generic defaults (overwritten per scenario below)
+    perfCfg.ignLat   = NaN;
+    perfCfg.ignLon   = NaN;
+    perfCfg.zoom0    = NaN;
+    perfCfg.mapW     = 640;
+    perfCfg.mapH     = 480;
+    perfCfg.scale    = 2;
+    
+    perfCfg.useGUIForScreenshot = true;
+    perfCfg.snapFile = "";
+    
+    perfCfg.outOverlay = "aligned_overlay.png";
+    perfCfg.outMask    = "perimeter_mask_warped.png";
+    perfCfg.outCSV     = "fire_perimeter_latlon.csv";
+    perfCfg.outKML     = "fire_perimeter.kml";
+    
+    perfCfg.minInliersAccept = 12;
+    perfCfg.doFigures = true;
+    
+    % Post-perimeter / plotting defaults
+    perfCfg.dayPerimeter        = NaN;
+    perfCfg.plotSuppression     = true;
+    perfCfg.supp_dtHours        = 0.25;   % 15 min resolution
+    perfCfg.supp_tMaxDays       = 100;
+    perfCfg.naturalHalfLifeDays = 8.5;
+    
+    %% === STK OBSERVATION METRICS TOGGLES ===
+    doRunSTKObs = true;
+    stkObsCacheFile = 'stk_obs_cache.mat';
+    
+    % STK cache / scenario settings
+    stkStartStr   = '';
+    stkStopStr    = '';
+    stkFireLat    = NaN;
+    stkFireLon    = NaN;
+    stkFireAlt_km = 0;
+    
+    % Build cache for up to this many EO sats
+    stkMaxEO = 8;
+    
+    %% === DETECTION DELAY WHAT-IF SETTINGS ===
+    doDelaySweep = true;
+    plotDelayComparison = true;
+    
+    % Manual delay cases [days]
+    perfCfg.detectionDelayDaysVec = [0; 2/24; 4/24; 8/24; 12/24];
+    
+    % Optional fallback slope [acres/day] if no growth curve exists
+    perfCfg.delaySlopeAcresPerDay = NaN;
+    
+    % Run one base/nominal case with the normal figures first
+    doNominalFigureRun = true;
+    
+    %% === STEP 1: Load DSM Data ===
+    raw        = readcell(inputFile, 'Sheet', inputSheet);
+    elements   = raw(2:end, 1);
+    DSM_data   = raw(2:end, 2:end);
+    numElems   = size(DSM_data, 1);
+    
+    % === Load eta from column CH (col 86) ===
+    eta_col = 86;
+    if size(raw,2) < eta_col
+        error('Eta column CH (col %d) not found in sheet. Check that eta is in column CH.', eta_col);
+    end
+    
+    eta_raw = raw(2:1+numElems, eta_col);
+    eta_orig = nan(numElems,1);
+    for i = 1:numElems
+        eta_orig(i) = robustToDouble(eta_raw{i});
+    end
+    if any(isnan(eta_orig))
+        warning('Some eta values are NaN (check CH2:CH%d for blanks/non-numeric).', 1+numElems);
+    end
+    
+    % === Load suppression capability from column CI (col 87), interpreted as acres/use ===
+    supp_col  = 87;
+    supp_orig = nan(numElems,1);
+    
+    if size(raw,2) >= supp_col
+        supp_raw = raw(2:1+numElems, supp_col);
+        for i = 1:numElems
+            supp_orig(i) = robustToDouble(supp_raw{i});
+        end
+        if any(isnan(supp_orig))
+            warning('Some suppression capability values are NaN (check CI2:CI%d for blanks/non-numeric).', 1+numElems);
+        end
+    else
+        warning('Suppression column CI (col %d) not found. Filling suppression capability with NaN.', supp_col);
+        supp_orig(:) = nan;
+    end
+    
+    % === Load suppression cycle interval from column CK (col 88), days ===
+    cycle_col  = 88;
+    cycle_orig = nan(numElems,1);
+    
+    if size(raw,2) >= cycle_col
+        cycle_raw = raw(2:1+numElems, cycle_col);
+        for i = 1:numElems
+            cycle_orig(i) = robustToDouble(cycle_raw{i});
+        end
+        if any(isnan(cycle_orig))
+            warning('Some cycle_days values are NaN (check CK2:CK%d for blanks/non-numeric).', 1+numElems);
+        end
+    else
+        warning('Cycle column CK (col %d) not found. Filling cycle_days with NaN.', cycle_col);
+        cycle_orig(:) = nan;
+    end
+    
+    %% === SCENARIO PRESETS (Include + Multiplicity ONLY) ===
+    scenarioPresets = struct();
+    
+    buttePairs = { ...
+        'Very Large Air Tankers', 1; ...
+        'Large Air Tankers', 2; ...
+        'Single Engine Airtankers', 4; ...
+        'Helicopters Type I', 6; ...
+        'Helicopters Type II', 8; ...
+        'Helicopters Type III', 10; ...
+        'Tactical Lead Planes', 2; ...
+        'Smokejumper Aircraft', 1; ...
+        'Tactical UAS', 3; ...
+        'EO Satellites (OroraTech)', 8; ...
+        'Weather Satellites (GOES-16/GOES-18)', 0; ...
+        'Comms Satellites (Iridium)', 1; ...
+        'Satellite Imagery Systems (VIIRS Pipeline)', 1; ...
+        'Fire Engines', 622; ...
+        'Airbase Support Systems', 2; ...
+        'C3 Systems', 1; ...
+    
+        % Functional
+        'Deploy Air Assets', 1; ...
+        'Lead Tankers', 1; ...
+        'Supervise Air Attacks (AAGs)', 1; ...
+        'Drop Water', 1; ...
+        'Drop Fire Retardant', 1; ...
+        'Perform Post-Drop Assessment', 1; ...
+        'Dispatch To Reloading Base', 1; ...
+        'Deploy Ground Assets', 1; ...
+        'Establish Containment Lines', 1; ...
+        'Spill Water from Ground Assets', 1; ...
+        'Tactically Monitor Fires', 1; ...
+        'Predict New Fires', 1; ...
+        'Detect Fires', 1; ...
+        'Visually Confirm Fires', 1; ...
+        'Predict Fire Paths/Behavior', 1; ...
+        'Strategically Monitor Fires', 1; ...
+        'Gather Real Time Data from Assets', 1; ...
+        'Build Real Time Situational Awareness', 1; ...
+        'Coordinate Air & Ground Resources', 1; ...
+        'Dynamically Allocate Resources', 1; ...
+        'Issue Commands to Assets', 1; ...
+        'Communicate to Resources', 1; ...
+        'Maintain Communication Among Assets', 1; ...
+        'Maintain Communication Between Assets and C3', 1; ...
+        'Deploy First Response Ground Assets', 1; ...
+        'Deploy Smokejumpers', 1; ...
+        'Activate MAFFS', 1; ...
+        'Refuel Airborne Assets', 1; ...
+        'Provide MRO for Assets', 1; ...
+        'Refill Water and Fire Retardants', 1; ...
+        'Provide Logistic Support to Crews', 1; ...
+    
+        % Orgs
+        'Federal Emergency Management Agency', 1; ...
+        'National Interagency Fire Center', 1; ...
+        'US Forest Service', 1; ...
+        'Bureau Of Land Management (BLM)', 1; ...
+        'National Park Service (NPS)', 1; ...
+        'US Fish & Wildlife Services (USFWS)', 1; ...
+        'Bureau Of Indian Affairs (BIA)', 1; ...
+        'US Department of Defense (DOD)', 1; ...
+        'Military Organizations (US National Guard/DOD)', 1; ...
+        'Local Fire Departments', 1; ...
+        'Volunteer Firefighting Organizations', 2; ...
+        'Private Aircraft Operators', 2; ...
+        'National Weather Service (NWS)', 1; ...
+        'National Oceanic & Atmospheric Admin (NOAA)', 1; ...
+        'FAA', 1; ...
+        'U.S. Federal Government', 1; ...
+        'State Governors'' Offices', 1; ...
+        };
+    
+    scenarioPresets.ButteCounty_mult = containers.Map(buttePairs(:,1), cell2mat(buttePairs(:,2)));
+    
+    % Starter baseline for Etosha National Park wildfire
+    % NOTE:
+    % - This is a proposed low-resource / remote-area baseline using only the
+    %   elements available in the current DSM taxonomy.
+    % - Tune the multiplicities in the GUI after applying the preset if needed.
+    etoshaPairs = { ...
+        'Large Air Tankers', 1; ...
+        'Single Engine Airtankers', 2; ...
+        'Helicopters Type I', 1; ...
+        'Tactical UAS', 9; ...
+        'HAPS', 1; ...
+        'EO Satellites (OroraTech)', 4; ...
+        'Weather Satellites (GOES-16/GOES-18)', 1; ...
+        'Comms Satellites (Iridium)', 1; ...
+        'Satellite Imagery Systems (VIIRS Pipeline)', 1; ...
+        'Fire Engines', 91; ...
+        'Airbase Support Systems', 1; ...
+        'C3 Systems', 1; ...
+    
+        % Functional
+        'Deploy Air Assets', 1; ...
+        'Lead Tankers', 1; ...
+        'Supervise Air Attacks (AAGs)', 1; ...
+        'Drop Water', 1; ...
+        'Drop Fire Retardant', 1; ...
+        'Perform Post-Drop Assessment', 1; ...
+        'Dispatch To Reloading Base', 1; ...
+        'Deploy Ground Assets', 1; ...
+        'Establish Containment Lines', 1; ...
+        'Spill Water from Ground Assets', 1; ...
+        'Tactically Monitor Fires', 1; ...
+        'Predict New Fires', 1; ...
+        'Detect Fires', 1; ...
+        'Visually Confirm Fires', 1; ...
+        'Predict Fire Paths/Behavior', 1; ...
+        'Strategically Monitor Fires', 1; ...
+        'Gather Real Time Data from Assets', 1; ...
+        'Build Real Time Situational Awareness', 1; ...
+        'Coordinate Air & Ground Resources', 1; ...
+        'Dynamically Allocate Resources', 1; ...
+        'Issue Commands to Assets', 1; ...
+        'Communicate to Resources', 1; ...
+        'Maintain Communication Among Assets', 1; ...
+        'Maintain Communication Between Assets and C3', 1; ...
+        'Deploy First Response Ground Assets', 1; ...
+        'Refuel Airborne Assets', 1; ...
+        'Provide MRO for Assets', 1; ...
+        'Refill Water and Fire Retardants', 1; ...
+        'Provide Logistic Support to Crews', 1; ...
+    
+        % Organizations / ecosystem support
+        'Environmental Protection Agency', 1; ...
+        'Satellite Manufacturers', 1; ...
+        'UAS Manufacturers', 1; ...
+        'C3 Systems Suppliers', 1; ...
+        'Communication Systems Suppliers', 1; ...
+        'Geospatial Information System Companies', 1; ...
+        'Cloud Service Providers', 1; ...
+        'Firefighting Equipment Suppliers', 1; ...
+        'Fire Engines Manufacturers', 1; ...
+        'Local Fire Departments', 1; ...
+        'Volunteer Firefighting Organizations', 1; ...
+        'Private Aircraft Operators', 1; ...
+        };
+    
+    scenarioPresets.Etosha_mult = containers.Map(etoshaPairs(:,1), cell2mat(etoshaPairs(:,2)));
+    
+    % Starter baseline for major US/Canadian wildfire response (Canada, May 2023)
+    % NOTE:
+    % - This is a proposed binational / international-aid baseline.
+    % - Tune the multiplicities in the GUI after applying the preset if needed.
+    canadaPairs = { ...
+        'Very Large Air Tankers', 2; ...
+        'Large Air Tankers', 2; ...
+        'Single Engine Airtankers', 3; ...
+        'Water Scoopers', 4; ...
+        'Military Airborne Firefighting System', 1; ...
+        'Helicopters Type I', 4; ...
+        'Helicopters Type II', 4; ...
+        'Helicopters Type III', 2; ...
+        'Tactical Lead Planes', 2; ...
+        'Air Attack Group Supervisor (AAGS)', 1; ...
+        'Tactical UAS', 4; ...
+        'HAPS', 1; ...
+        'EO Satellites (OroraTech)', 8; ...
+        'Weather Satellites (GOES-16/GOES-18)', 3; ...
+        'Comms Satellites (Iridium)', 1; ...
+        'Satellite Imagery Systems (VIIRS Pipeline)', 1; ...
+        'Fire Engines', 40; ...
+        'Airbase Support Systems', 3; ...
+        'C3 Systems', 1; ...
+    
+        % Functional
+        'Deploy Air Assets', 1; ...
+        'Lead Tankers', 1; ...
+        'Supervise Air Attacks (AAGs)', 1; ...
+        'Drop Water', 1; ...
+        'Drop Fire Retardant', 1; ...
+        'Perform Post-Drop Assessment', 1; ...
+        'Dispatch To Reloading Base', 1; ...
+        'Deploy Ground Assets', 1; ...
+        'Establish Containment Lines', 1; ...
+        'Spill Water from Ground Assets', 1; ...
+        'Tactically Monitor Fires', 1; ...
+        'Predict New Fires', 1; ...
+        'Detect Fires', 1; ...
+        'Visually Confirm Fires', 1; ...
+        'Predict Fire Paths/Behavior', 1; ...
+        'Strategically Monitor Fires', 1; ...
+        'Gather Real Time Data from Assets', 1; ...
+        'Build Real Time Situational Awareness', 1; ...
+        'Coordinate Air & Ground Resources', 1; ...
+        'Dynamically Allocate Resources', 1; ...
+        'Issue Commands to Assets', 1; ...
+        'Communicate to Resources', 1; ...
+        'Maintain Communication Among Assets', 1; ...
+        'Maintain Communication Between Assets and C3', 1; ...
+        'Deploy First Response Ground Assets', 1; ...
+        'Deploy Smokejumpers', 1; ...
+        'Activate MAFFS', 1; ...
+        'Refuel Airborne Assets', 1; ...
+        'Provide MRO for Assets', 1; ...
+        'Refill Water and Fire Retardants', 1; ...
+        'Provide Logistic Support to Crews', 1; ...
+    
+        % Organizations / governance
+        'Environmental Protection Agency', 1; ...
+        'Military Organizations (US National Guard/DOD)', 1; ...
+        'Manufacturers Of VLAT/LAT', 1; ...
+        'Manufacturers Of Lead Plane & AAGS', 1; ...
+        'Satellite Manufacturers', 1; ...
+        'UAS Manufacturers', 1; ...
+        'C3 Systems Suppliers', 1; ...
+        'Communication Systems Suppliers', 1; ...
+        'Geospatial Information System Companies', 1; ...
+        'Cloud Service Providers', 1; ...
+        'Firefighting Equipment Suppliers', 1; ...
+        'Fire Engines Manufacturers', 1; ...
+        'Local Fire Departments', 1; ...
+        'Volunteer Firefighting Organizations', 3; ...
+        'Private Aircraft Operators', 3; ...
+        'National Weather Service (NWS)', 1; ...
+        'National Oceanic & Atmospheric Admin (NOAA)', 1; ...
+        'FAA', 1; ...
+        'State Governors'' Offices', 1; ...
+        'Provincial Emergency Agencies (e.g., Ontario EMO)', 1; ...
+        'Canadian Interagency Forest Fire Centre (CIFFC)', 1; ...
+        'Global Affairs Canada', 1; ...
+        'U.S. Department of State', 1; ...
+        'U.S. Federal Government', 1; ...
+        'Government of Canada', 1; ...
+        'Federal Emergency Management Agency', 1; ...
+        'National Interagency Fire Center', 1; ...
+        'US Forest Service', 1; ...
+        'US Department of Defense (DOD)', 1;
+        };
+    
+    scenarioPresets.USCanadianWildfires_mult = containers.Map(canadaPairs(:,1), cell2mat(canadaPairs(:,2)));
+    
+    %% === STEP 2: GUI for Include / Multiplicity / Suppression / CycleDays ===
+    included      = num2cell(true(numElems, 1));
+    multiplicity  = num2cell(ones(numElems, 1));
+    suppCap       = num2cell(supp_orig(:));
+    cycleDays     = num2cell(cycle_orig(:));
+    
+    cellData      = [elements, included, multiplicity, suppCap, cycleDays];
+    
+    f = uifigure('Name','Element Selector','Position',[300 300 980 650]);
+    
+    t = uitable(f, ...
+        'Data', cellData, ...
+        'ColumnEditable', [false true true true true], ...
+        'ColumnFormat', {'char', 'logical', 'numeric', 'numeric', 'numeric'}, ...
+        'ColumnName', {'Element','Include','Multiplicity','Suppress (acres/use)','Cycle (days)'}, ...
+        'Position', [10 140 960 500]);
+    
+    scenarioNames = {'(Custom)', 'Butte County', 'Etosha National Park', 'US/Canadian Wildfires'};
+    dd = uidropdown(f, ...
+        'Items', scenarioNames, ...
+        'Value', '(Custom)', ...
+        'Position', [10 95 240 30]);
+    
+    uibutton(f, 'Text', 'Apply Scenario', ...
+        'Position', [260 95 150 30], ...
+        'ButtonPushedFcn', @(btn,event) applyScenarioPreset(dd, t, scenarioPresets));
+    
+    uibutton(f, 'Text', 'Proceed', ...
+        'Position', [810 20 160 45], ...
+        'ButtonPushedFcn', @(btn,event) uiresume(f));
+    
+    uiwait(f);
+    updatedData = t.Data;
+    selectedScenario = string(dd.Value);
+    close(f);
+    
+    % Store selected scenario for downstream performance / reporting hooks
+    perfCfg.selectedScenario = selectedScenario;
+    switch char(selectedScenario)
+        case 'Butte County'
+            perfCfg.scenarioName = "Butte County";
+            perfOutSheet         = 'ButteCounty';
+    
+            perfCfg.ignLat   = 39.8134;
+            perfCfg.ignLon   = -121.4347;
+            perfCfg.centerLat = NaN;
+            perfCfg.centerLon = NaN;
+            perfCfg.zoom0    = 10;
+    
+            perfCfg.outOverlay = "aligned_overlay.png";
+            perfCfg.outMask    = "perimeter_mask_warped.png";
+            perfCfg.outCSV     = "butte_perimeter_latlon.csv";
+            perfCfg.outKML     = "butte_perimeter.kml";
+    
+            perfCfg.minInliersAccept = 20;
+            perfCfg.dayPerimeter     = 3.0;
+    
+            % STK settings
+            stkStartStr   = '9 Oct 2023 14:10:00.000';
+            stkStopStr    = '10 Oct 2023 14:10:00.000';
+            stkFireLat    = 38.0;
+            stkFireLon    = -122.5;
+            stkFireAlt_km = 0;
+            stkMaxEO      = 8;
+    
+        case 'Etosha National Park'
+            perfCfg.scenarioName = "Etosha National Park";
+            perfOutSheet         = 'Etosha';
+    
+            perfCfg.ignLat    = -19.2612; 
+            perfCfg.ignLon    = 14.4758;
+            perfCfg.centerLat = -18.95;
+            perfCfg.centerLon = 16.15;
+            perfCfg.zoom0     = 8;
+    
+            perfCfg.mapW     = 1280;
+            perfCfg.mapH     = 1280;
+            perfCfg.scale    = 2;
+    
+            perfCfg.outOverlay = "etosha_overlay_preview.png";
+            perfCfg.outMask    = "etosha_mask_warp.png";
+            perfCfg.outCSV     = "etosha_burnscar_latlon.csv";
+            perfCfg.outKML     = "etosha_burnscar.kml";
+    
+            perfCfg.minInliersAccept = 20;
+            perfCfg.dayPerimeter     = 8;
+    
+            % STK settings
+            stkStartStr   = '22 Sep 2025 00:00:00.000';
+            stkStopStr    = '30 Sep 2025 23:59:59.000';
+            stkFireLat    = perfCfg.ignLat;
+            stkFireLon    = perfCfg.ignLon;
+            stkFireAlt_km = 0;
+            stkMaxEO      = 4;
+    
+        case 'US/Canadian Wildfires'
+            perfCfg.scenarioName = "US/Canadian Wildfires";
+            perfOutSheet         = 'USCanadianWildfires';
+    
+            % Representative Canada 2023 wildfire case baseline
+            % You can refine these later if you want a more specific fire
+            perfCfg.ignLat   = 43.669124;
+            perfCfg.ignLon   = -65.355936;
+            perfCfg.centerLat = 43.669124;
+            perfCfg.centerLon = -65.355936;
+            perfCfg.zoom0    = 10;
+    
+            perfCfg.mapW     = 1280;
+            perfCfg.mapH     = 1280;
+            perfCfg.scale    = 2;
+    
+            perfCfg.outOverlay = "canada_overlay_preview.png";
+            perfCfg.outMask    = "canada_perimeter_mask.png";
+            perfCfg.outCSV     = "canada_perimeter_latlon.csv";
+            perfCfg.outKML     = "canada_perimeter.kml";
+    
+            perfCfg.minInliersAccept = 13;
+            perfCfg.dayPerimeter     = 19;
+    
+            % STK settings
+            stkStartStr   = '27 May 2023 00:00:00.000';
+            stkStopStr    = '21 Jun 2023 23:59:59.000';
+            stkFireLat    = perfCfg.ignLat; 
+            stkFireLon    = perfCfg.ignLon;
+            stkFireAlt_km = 0;
+            stkMaxEO      = 8;
+    
+        otherwise
+            perfCfg.scenarioName = "Custom";
+            perfOutSheet         = 'CustomScenario';
+            warning('Custom scenario selected. Performance config values were not auto-assigned.');
+    end
+    
+    % Setting the file 
+    stkObsCacheFile = sprintf('stk_obs_cache_%s.mat', regexprep(char(selectedScenario), '[^a-zA-Z0-9]', '_'));
+    
+    %% === STEP 2.5: Plot hierarchy (Toggled) ===
+    if doPlotHierarchy
+        updatedTable = cell2table(updatedData, ...
+            'VariableNames', {'Element', 'Include', 'Multiplicity', 'Suppress_val', 'Cycle_days'});
+    
+        includedIdx = find(updatedTable.Include);
+    
+        scenarioNames = string(updatedTable.Element(includedIdx));
+        scenarioNames = clean_string(scenarioNames);
+    
+        multVals = updatedTable.Multiplicity(includedIdx);
+        multMapScenario = containers.Map(cellstr(scenarioNames), double(multVals));
+    
+        orgList = clean_string([ ...
+            "Federal Emergency Management Agency"
+            "National Interagency Fire Center"
+            "US Forest Service"
+            "Bureau Of Land Management (BLM)"
+            "National Park Service (NPS)"
+            "US Fish & Wildlife Services (USFWS)"
+            "Bureau Of Indian Affairs (BIA)"
+            "US Department of Defense (DOD)"
+            "Military Organizations (US National Guard/DOD)"
+            "Local Fire Departments"
+            "Volunteer Firefighting Organizations"
+            "Private Aircraft Operators"
+            "National Weather Service (NWS)"
+            "National Oceanic & Atmospheric Admin (NOAA)"
+            "FAA"
+            "U.S. Federal Government"
+            "State Governors'' Offices"
+        ]);
+    
+        funcList = clean_string([ ...
+            "Deploy Air Assets"
+            "Lead Tankers"
+            "Supervise Air Attacks (AAGs)"
+            "Drop Water"
+            "Drop Fire Retardant"
+            "Perform Post-Drop Assessment"
+            "Dispatch To Reloading Base"
+            "Deploy Ground Assets"
+            "Establish Containment Lines"
+            "Spill Water from Ground Assets"
+            "Tactically Monitor Fires"
+            "Predict New Fires"
+            "Detect Fires"
+            "Visually Confirm Fires"
+            "Predict Fire Paths/Behavior"
+            "Strategically Monitor Fires"
+            "Gather Real Time Data from Assets"
+            "Build Real Time Situational Awareness"
+            "Coordinate Air & Ground Resources"
+            "Dynamically Allocate Resources"
+            "Issue Commands to Assets"
+            "Communicate to Resources"
+            "Maintain Communication Among Assets"
+            "Maintain Communication Between Assets and C3"
+            "Deploy First Response Ground Assets"
+            "Deploy Smokejumpers"
+            "Activate MAFFS"
+            "Refuel Airborne Assets"
+            "Provide MRO for Assets"
+            "Refill Water and Fire Retardants"
+            "Provide Logistic Support to Crews"
+        ]);
+    
+        structList = clean_string([ ...
+            "Very Large Air Tankers"
+            "Large Air Tankers"
+            "Single Engine Airtankers"
+            "Water Scoopers"
+            "Military Airborne Firefighting System"
+            "Helicopters Type I"
+            "Helicopters Type II"
+            "Helicopters Type III"
+            "Tactical Lead Planes"
+            "Air Attack Group Supervisor (AAGS)"
+            "Smokejumper Aircraft"
+            "Tactical UAS"
+            "HAPS"
+            "EO Satellites (OroraTech)"
+            "Weather Satellites (GOES-16/GOES-18)"
+            "Comms Satellites (Iridium)"
+            "Satellite Imagery Systems (VIIRS Pipeline)"
+            "Fire Engines"
+            "Airbase Support Systems"
+            "C3 Systems"
+        ]);
+    
+        plotHierarchyFromDSMCell( ...
+            scenarioNames, multMapScenario, ...
+            elements, DSM_data, ...
+            orgList, funcList, structList, ...
+            "Scenario Hierarchy");
+    end
+    
+    %% === STEP 3: Expand Elements (eta + suppression + cycle_days) by Multiplicity ===
+    updatedTable    = cell2table(updatedData, ...
+        'VariableNames', {'Element', 'Include', 'Multiplicity', 'Suppress_val', 'Cycle_days'});
+    
+    includedIdx     = find(updatedTable.Include);
+    multiplicities  = updatedTable.Multiplicity;
+    
+    expandedElements  = {};
+    expandedEta       = [];
+    expandedSupp      = [];
+    expandedCycleDays = [];
+    expansionMap      = [];
+    
+    for i = 1:length(includedIdx)
+        origIdx  = includedIdx(i);
+        m        = multiplicities(origIdx);
+        baseName = updatedTable.Element{origIdx};
+    
+        sCap     = updatedTable.Suppress_val(origIdx);
+        cDays    = updatedTable.Cycle_days(origIdx);
+    
+        for j = 1:m
+            expandedElements{end+1,1}  = sprintf('%s', baseName);  
+            expansionMap(end+1,1)      = origIdx;                  
+            expandedEta(end+1,1)       = eta_orig(origIdx);        
+            expandedSupp(end+1,1)      = sCap;                     
+            expandedCycleDays(end+1,1) = cDays;                    
+        end
+    end
+    
+    N = length(expandedElements);
+    expandedDSM = cell(N);
+    
+    %% === STEP 4: Identify All Unique Interface Characters Used ===
+    allLetters = [];
+    for i = 1:numElems
+        for j = 1:numElems
+            val = DSM_data{i,j};
+            if ischar(val) || isstring(val)
+                allLetters = [allLetters, char(val)]; %#ok<AGROW>
+            end
+        end
+    end
+    allLetters     = allLetters(:);
+    allLetters     = allLetters(isstrprop(allLetters, 'graphic'));
+    interfaceChars = unique(allLetters, 'stable');
+    nInterfaces    = numel(interfaceChars);
+    
+    %% === STEP 5: Expand DSM and Count Interfaces ===
+    interfaceCounts = zeros(N, nInterfaces);
+    
+    for row = 1:N
+        for col = 1:N
+            origRow = expansionMap(row);
+            origCol = expansionMap(col);
+            entry   = DSM_data{origRow, origCol};
+            expandedDSM{row, col} = entry;
+    
+            if ischar(entry) || isstring(entry)
+                entryStr = char(entry);
+                for k = 1:nInterfaces
+                    c = char(interfaceChars(k));
+                    interfaceCounts(row, k) = interfaceCounts(row, k) + count(entryStr, c);
+                end
+            end
+        end
+    end
+    
+    %% === STEP 6: Write Expanded DSM Matrix to Excel ===
+    headerRow   = [{''}, expandedElements'];
+    dataRows    = [expandedElements, expandedDSM];
+    labeledDSM  = [headerRow; dataRows];
+    
+    for i = 1:size(labeledDSM, 1)
+        for j = 1:size(labeledDSM, 2)
+            if ismissing(labeledDSM{i,j})
+                labeledDSM{i,j} = "";
+            end
+        end
+    end
+    
+    writecell(labeledDSM, outputDSM);
+    disp('Expanded DSM matrix written to Excel.');
+    
+    %% === STEP 7: Write Interface Count Table (with eta + suppression + cycle_days) ===
+    interfaceNames = cellstr(num2cell(interfaceChars(:)));
+    T = array2table(interfaceCounts, ...
+        'VariableNames', matlab.lang.makeValidName(interfaceNames));
+    
+    T = addvars(T, expandedElements, 'Before', 1, 'NewVariableNames', {'Element'});
+    T = addvars(T, expandedEta(:),  'After', 'Element', 'NewVariableNames', {'eta'});
+    T = addvars(T, expandedSupp(:), 'After', 'eta',     'NewVariableNames', {'suppress_val'});
+    T = addvars(T, expandedCycleDays(:), 'After', 'suppress_val', 'NewVariableNames', {'cycle_days'});
+    
+    try
+        [~, ~, oldRaw] = xlsread(outputCount, outputSheet);
+        numOldRows     = size(oldRaw, 1);
+        numOldCols     = size(oldRaw, 2);
+        lastCol        = excelColumn(numOldCols);
+        clearRange     = sprintf('A1:%s%d', lastCol, numOldRows);
+        writecell(repmat({''}, numOldRows, numOldCols), ...
+            outputCount, 'Sheet', outputSheet, 'Range', clearRange);
+    catch
+        warning('Could not clear old output sheet.');
+    end
+    
+    writetable(T, outputCount, 'Sheet', outputSheet, 'WriteRowNames', false);
+    disp('Interface count table written to Excel (with eta + suppression + cycle_days).');
+
+%% === STEP 7.5: Compute Complexity Before Performance Model ===
+% This step computes the architecture complexity after the DSM has been
+% expanded and the interface count table has been written. Previously, this
+% was done by running full_complexity_loader.m separately after DSMParseV3.
+% It is now called automatically before the performance model.
+
+fprintf('\n=== Complexity Calculation ===\n');
+
+% Run the standalone complexity script.
+% This script reads:
+%   - DSM_Interface_Counts.xlsx
+%   - SOS DSM.xlsx
+%   - Wildfire Response Function Criticality.xlsx
+%
+% It computes the weighted Sinha complexity using C1, C2, and C3.
+si;
+
+% Store the final complexity value in a named variable for later use.
+% full_complexity_loader creates total_complexity in the workspace.
+architectureComplexity = total_complexity;
+
+fprintf('Architecture complexity = %.4f\n', architectureComplexity);
+    
+    %% === STEP 8: Call performance model with DSM-expanded resources ===
+    if doRunPerformance
+        resources = struct();
+        resources.expandedElements  = string(expandedElements);
+        resources.expandedEta       = expandedEta(:);
+        resources.expandedSuppVal   = expandedSupp(:);
+        resources.expandedCycleDays = expandedCycleDays(:);
+    
+        resources.interfaceChars    = interfaceChars(:);
+        resources.interfaceCounts   = interfaceCounts;
+    
+        resources.totalSupp_raw = nansum(resources.expandedSuppVal);
+        resources.totalSupp_eta = nansum(resources.expandedSuppVal .* max(resources.expandedEta,0));
+    
+        fprintf('\n=== DSM -> Performance Link ===\n');
+        fprintf('Expanded N = %d\n', N);
+        fprintf('Total suppression (raw sum) = %.4f\n', resources.totalSupp_raw);
+        fprintf('Total suppression (eta-weighted sum) = %.4f\n', resources.totalSupp_eta);
+    
+        % ---------------- STK observation metrics ----------------
+        obs = struct();
+        obs.EO_MinObsGap_hr = NaN;
+        obs.EO_MaxObsGap_hr = NaN;
+        obs.Weather_MinObsGap_hr = NaN;
+        obs.AllSat_MinObsGap_hr = NaN;
+        obs.AllSat_MaxObsGap_hr = NaN;
+    
+        if doRunSTKObs
+            if isfile(stkObsCacheFile)
+                Sobs = load(stkObsCacheFile, 'stkObs');
+                stkObs = Sobs.stkObs;
+                fprintf('Loaded STK observation cache from %s\n', stkObsCacheFile);
+            else
+                fprintf('Building STK observation cache...\n');
+                stkObs = build_stk_observation_cache( ...
+                    stkStartStr, stkStopStr, ...
+                    stkFireLat, stkFireLon, stkFireAlt_km, ...
+                    stkMaxEO);
+                save(stkObsCacheFile, 'stkObs', '-v7.3');
+                fprintf('Saved STK observation cache to %s\n', stkObsCacheFile);
+            end
+    
+            obs = compute_obs_metrics_from_resources(resources, stkObs);
+    
+            fprintf(['Single-case observation gaps [hr] | ', ...
+                     'EO(min,max)=(%s,%s) | Weather=%s | All(min,max)=(%s,%s)\n'], ...
+                fmtGap(obs.EO_MinObsGap_hr), ...
+                fmtGap(obs.EO_MaxObsGap_hr), ...
+                fmtGap(obs.Weather_MinObsGap_hr), ...
+                fmtGap(obs.AllSat_MinObsGap_hr), ...
+                fmtGap(obs.AllSat_MaxObsGap_hr));
+        end
+    
+        % ---------------- Build detection delay cases ----------------
+        if doDelaySweep
+            manualDelayDays = perfCfg.detectionDelayDaysVec(:);
+    
+            stkDelayDays = [
+                obs.EO_MinObsGap_hr      / 24
+                obs.EO_MaxObsGap_hr      / 24
+                obs.Weather_MinObsGap_hr / 24
+                obs.AllSat_MinObsGap_hr  / 24
+                obs.AllSat_MaxObsGap_hr  / 24
+            ];
+    
+            stkDelayDays = stkDelayDays(isfinite(stkDelayDays) & stkDelayDays >= 0);
+            delayDaysVec = unique([0; manualDelayDays; stkDelayDays], 'sorted');
+        else
+            delayDaysVec = 0;
+        end
+    
+        fprintf('\nUsing detection delay cases [hr]:\n');
+        disp(24 * delayDaysVec.');
+    
+        % ---------------- One nominal/base run with normal figures ----------------
+        perfNominal = struct();
+        
+        if doNominalFigureRun
+            cfgNom = perfCfg;
+            cfgNom.fastMode = false;
+            cfgNom.detectionDelayDays = 0;
+            cfgNom.doFigures = true;
+            cfgNom.saveGif   = false;
+        
+            fprintf('\n--- Running nominal/base case with normal figures ---\n');
+            perfNominal = wildfire_performance_model(cfgNom, resources);
+        else
+            cfgNom = perfCfg;
+            cfgNom.fastMode = false;
+            cfgNom.detectionDelayDays = 0;
+            cfgNom.doFigures = false;
+            cfgNom.saveGif   = false;
+        
+            fprintf('\n--- Running nominal/base case silently to get A0 ---\n');
+            perfNominal = wildfire_performance_model(cfgNom, resources);
+        end
+    
+        if ~isfield(perfNominal,'A0_perimeterDay_acres') || isnan(perfNominal.A0_perimeterDay_acres) || perfNominal.A0_perimeterDay_acres <= 0
+            error('DSMParseV3:InvalidNominalA0', ...
+                'Nominal run did not return a valid A0_perimeterDay_acres for delay sweep.');
+        end
+    
+        A0_base_for_delay = perfNominal.A0_perimeterDay_acres;
+    
+        delaySlopeBase = NaN;
+        if isfield(perfNominal,'delaySlopeAcresPerDay')
+            delaySlopeBase = perfNominal.delaySlopeAcresPerDay;
+        end
+    
+        nominalGrowth_tDays = [];
+        nominalGrowth_areaAcres = [];
+        if isfield(perfNominal,'nominalGrowth_tDays')
+            nominalGrowth_tDays = perfNominal.nominalGrowth_tDays;
+        end
+        if isfield(perfNominal,'nominalGrowth_areaAcres')
+            nominalGrowth_areaAcres = perfNominal.nominalGrowth_areaAcres;
+        end
+    
+        % ---------------- Silent delay sweep (FAST MODE) ----------------
+        nDelay = numel(delayDaysVec);
+        perfRuns = cell(nDelay,1);
+        summaryRows = [];
+    
+        for k = 1:nDelay
+            cfgThis = perfCfg;
+    
+            cfgThis.fastMode = true;
+            cfgThis.A0_override_acres = A0_base_for_delay;
+            cfgThis.A0_nominal_override_acres = A0_base_for_delay;
+            cfgThis.nominalGrowth_tDays = nominalGrowth_tDays;
+            cfgThis.nominalGrowth_areaAcres = nominalGrowth_areaAcres;
+    
+            cfgThis.detectionDelayDays = delayDaysVec(k);
+            cfgThis.doFigures = false;
+            cfgThis.saveGif   = false;
+            cfgThis.useGUIForScreenshot = false;
+            cfgThis.snapFile = "";
+    
+            if ~isnan(delaySlopeBase)
+                cfgThis.delaySlopeAcresPerDay = delaySlopeBase;
+            end
+    
+            fprintf('\n--- Running delay case %d/%d: %.3f days (%.1f hr) [FAST MODE] ---\n', ...
+                k, nDelay, delayDaysVec(k), 24*delayDaysVec(k));
+            
+            perfRuns{k} = wildfire_performance_model(cfgThis, resources);
+    
+            S = struct();
+            S.timestamp                  = string(datetime('now'));
+            S.delayDays                  = delayDaysVec(k);
+            S.delayHours                 = 24*delayDaysVec(k);
+            S.expandedN                  = N;
+            S.totalSupp_raw              = resources.totalSupp_raw;
+            S.totalSupp_eta              = resources.totalSupp_eta;
+    
+            if isfield(perfRuns{k},'targetAcres'),                  S.targetAcres = perfRuns{k}.targetAcres; else, S.targetAcres = NaN; end
+            if isfield(perfRuns{k},'areaEndAcres'),                 S.areaEndAcres = perfRuns{k}.areaEndAcres; else, S.areaEndAcres = NaN; end
+            if isfield(perfRuns{k},'daysTotal'),                    S.daysTotal = perfRuns{k}.daysTotal; else, S.daysTotal = NaN; end
+            if isfield(perfRuns{k},'containedDay'),                 S.containedDay = perfRuns{k}.containedDay; else, S.containedDay = NaN; end
+            if isfield(perfRuns{k},'resolvedDayAbs'),               S.resolvedDayAbs = perfRuns{k}.resolvedDayAbs; else, S.resolvedDayAbs = NaN; end
+            if isfield(perfRuns{k},'resolvedDaysAfterPerimeter'),   S.resolvedDaysAfterPerimeter = perfRuns{k}.resolvedDaysAfterPerimeter; else, S.resolvedDaysAfterPerimeter = NaN; end
+            if isfield(perfRuns{k},'AUC_total_acreDays'),           S.AUC_total_acreDays = perfRuns{k}.AUC_total_acreDays; else, S.AUC_total_acreDays = NaN; end
+            if isfield(perfRuns{k},'CO2_baseline_MMT'),             S.CO2_baseline_MMT = perfRuns{k}.CO2_baseline_MMT; else, S.CO2_baseline_MMT = NaN; end
+            if isfield(perfRuns{k},'CO2_est_millionMetricTons'),    S.CO2_est_millionMetricTons = perfRuns{k}.CO2_est_millionMetricTons; else, S.CO2_est_millionMetricTons = NaN; end
+            if isfield(perfRuns{k},'A0_perimeterDay_acres'),        S.A0_perimeterDay_acres = perfRuns{k}.A0_perimeterDay_acres; else, S.A0_perimeterDay_acres = NaN; end
+            if isfield(perfRuns{k},'A0_delayed_acres'),             S.A0_delayed_acres = perfRuns{k}.A0_delayed_acres; else, S.A0_delayed_acres = NaN; end
+    
+            S.EO_MinObsGap_hr      = obs.EO_MinObsGap_hr;
+            S.EO_MaxObsGap_hr      = obs.EO_MaxObsGap_hr;
+            S.Weather_MinObsGap_hr = obs.Weather_MinObsGap_hr;
+            S.AllSat_MinObsGap_hr  = obs.AllSat_MinObsGap_hr;
+            S.AllSat_MaxObsGap_hr  = obs.AllSat_MaxObsGap_hr;
+    
+            if k == 1
+                summaryRows = struct2table(S);
+            else
+                summaryRows = [summaryRows; struct2table(S)]; %#ok<AGROW>
+            end
+        end
+    
+        % ---------------- Combined delay comparison plot ----------------
+        if plotDelayComparison && nDelay >= 1
+            figure('Name','Burn Area vs Time - Detection Delay Comparison','Color','w');
+            hold on; grid on;
+    
+            cmap = lines(nDelay);
+            legText = strings(nDelay,1);
+    
+            for k = 1:nDelay
+                if isfield(perfRuns{k},'tAbsDays_total') && isfield(perfRuns{k},'areaAcres_total') ...
+                        && ~isempty(perfRuns{k}.tAbsDays_total) && ~isempty(perfRuns{k}.areaAcres_total)
+    
+                    plot(perfRuns{k}.tAbsDays_total, perfRuns{k}.areaAcres_total, ...
+                        'LineWidth', 2.2, 'Color', cmap(k,:));
+    
+                    legText(k) = sprintf('Delay = %.1f hr | A_0 = %.0f ac', ...
+                        24*delayDaysVec(k), perfRuns{k}.A0_delayed_acres);
+                end
+            end
+    
+            xlabel('Time [Days]');
+            ylabel('Burn Area [Acres]');
+            title('Burn Area vs. Time for Different Detection Delays');
+            legend(legText, 'Location','northeastoutside');
+    
+            xline(perfCfg.dayPerimeter, '--k', sprintf('Day %.2f perimeter', perfCfg.dayPerimeter), ...
+                'LabelOrientation','aligned', ...
+                'LabelVerticalAlignment','bottom');
+        end
+    
+        try
+            writetable(summaryRows, perfOutXlsx, 'Sheet', perfOutSheet, 'WriteRowNames', false);
+            disp("Performance summary written to: " + perfOutXlsx);
+        catch ME
+            warning("Could not write performance output Excel. MATLAB says:\n%s", ME.message);
+        end
+    end
+    
+    %% === Helper: Convert Integer to Excel Column Letters ===
+    function col = excelColumn(n)
+        col = '';
+        while n > 0
+            r = rem(n-1,26);
+            col = [char(r + 'A'), col]; %#ok<AGROW>
+            n = floor((n - 1) / 26);
+        end
+    end
+    
+    %% === Helper: Robust conversion to double ===
+    function x = robustToDouble(v)
+        x = nan;
+        if isnumeric(v) && isscalar(v) && ~isnan(v)
+            x = v;
+        elseif islogical(v) && isscalar(v)
+            x = double(v);
+        elseif ischar(v) || isstring(v)
+            vv = str2double(strtrim(string(v)));
+            if ~isnan(vv)
+                x = vv;
+            end
+        end
+    end
+    
+    %% === Helper: clean DSM names consistently ===
+    function s = clean_string(x)
+        s = strtrim(erase(string(x), char(160)));
+    end
+    
+    %% === Scenario Apply callback: ONLY sets Include + Multiplicity ===
+    function applyScenarioPreset(dd, t, scenarioPresets)
+        choice = dd.Value;
+        if isstring(choice), choice = char(choice); end
+    
+        switch choice
+            case 'Butte County'
+                presetMap_mult = scenarioPresets.ButteCounty_mult;
+            case 'Etosha National Park'
+                presetMap_mult = scenarioPresets.Etosha_mult;
+            case 'US/Canadian Wildfires'
+                presetMap_mult = scenarioPresets.USCanadianWildfires_mult;
+            otherwise
+                return;
+        end
+    
+        D = t.Data;
+    
+        for irow = 1:size(D,1)
+            name = D{irow,1};
+            if isstring(name), name = char(name); end
+    
+            if isKey(presetMap_mult, name)
+                D{irow,2} = true;
+                D{irow,3} = presetMap_mult(name);
+            else
+                D{irow,2} = false;
+                D{irow,3} = 1;
+            end
+        end
+    
+        t.Data = D;
+    end
+    
+    %% === STK helper: compute observation metrics from resources ===
+    function obs = compute_obs_metrics_from_resources(resources, stkObs)
+        obs = struct();
+        obs.EO_MinObsGap_hr = NaN;
+        obs.EO_MaxObsGap_hr = NaN;
+        obs.Weather_MinObsGap_hr = NaN;
+        obs.AllSat_MinObsGap_hr = NaN;
+        obs.AllSat_MaxObsGap_hr = NaN;
+    
+        nEO = get_resource_asset_count(resources, 'EO Satellites (OroraTech)');
+        nW  = get_resource_asset_count(resources, 'Weather Satellites (GOES-16/GOES-18)');
+    
+        nEO = max(0, min(nEO, numel(stkObs.eoNames)));
+        nW  = max(0, min(nW,  numel(stkObs.weatherNames)));
+    
+        eoNames = stkObs.eoNames(1:nEO);
+        wNames  = stkObs.weatherNames(1:nW);
+    
+        eoIntervals  = collect_intervals_from_cache(stkObs, eoNames);
+        wIntervals   = collect_intervals_from_cache(stkObs, wNames);
+        allIntervals = [eoIntervals; wIntervals];
+    
+        eoMerged  = merge_time_intervals(eoIntervals);
+        wMerged   = merge_time_intervals(wIntervals);
+        allMerged = merge_time_intervals(allIntervals);
+    
+        [obs.EO_MinObsGap_hr, obs.EO_MaxObsGap_hr] = observation_gap_stats_hours(eoMerged, stkObs.startStr, stkObs.stopStr);
+        [obs.Weather_MinObsGap_hr, ~]              = observation_gap_stats_hours(wMerged,  stkObs.startStr, stkObs.stopStr);
+        [obs.AllSat_MinObsGap_hr, obs.AllSat_MaxObsGap_hr] = observation_gap_stats_hours(allMerged, stkObs.startStr, stkObs.stopStr);
+    end
+    
+    function n = get_resource_asset_count(resources, assetName)
+        n = 0;
+        if isfield(resources, 'expandedElements')
+            names = string(resources.expandedElements(:));
+            n = sum(strcmp(names, string(assetName)));
+        end
+    end
+    
+    function intervals = collect_intervals_from_cache(stkObs, satNames)
+        intervals = NaT(0,2,'TimeZone','UTC');
+    
+        for i = 1:numel(satNames)
+            fld = matlab.lang.makeValidName(char(satNames(i)));
+            if isfield(stkObs.intervals, fld)
+                A = stkObs.intervals.(fld);
+                if ~isempty(A)
+                    intervals = [intervals; A]; %#ok<AGROW>
+                end
+            end
+        end
+    end
+    
+    function merged = merge_time_intervals(intervals)
+        if isempty(intervals)
+            merged = NaT(0,2,'TimeZone','UTC');
+            return;
+        end
+    
+        intervals = sortrows(intervals, 1);
+        merged = intervals(1,:);
+    
+        for i = 2:size(intervals,1)
+            s = intervals(i,1);
+            e = intervals(i,2);
+    
+            lastE = merged(end,2);
+    
+            if s <= lastE
+                merged(end,2) = max(lastE, e);
+            else
+                merged = [merged; [s e]]; %#ok<AGROW>
+            end
+        end
+    end
+    
+    function [gMin, gMax] = observation_gap_stats_hours(mergedIntervals, startStr, stopStr)
+        tStart = datetime(startStr, 'InputFormat','d MMM yyyy HH:mm:ss.SSS', 'TimeZone','UTC');
+        tStop  = datetime(stopStr,  'InputFormat','d MMM yyyy HH:mm:ss.SSS', 'TimeZone','UTC');
+    
+        gMin = NaN;
+        gMax = NaN;
+    
+        if isempty(mergedIntervals)
+            return;
+        end
+    
+        mergedIntervals = sortrows(mergedIntervals, 1);
+    
+        mergedIntervals(:,1) = max(mergedIntervals(:,1), tStart);
+        mergedIntervals(:,2) = min(mergedIntervals(:,2), tStop);
+    
+        keep = mergedIntervals(:,2) >= mergedIntervals(:,1);
+        mergedIntervals = mergedIntervals(keep,:);
+    
+        if isempty(mergedIntervals)
+            return;
+        end
+    
+        gapsHr = [];
+    
+        g0 = hours(mergedIntervals(1,1) - tStart);
+        if g0 > 0
+            gapsHr(end+1,1) = g0; %#ok<AGROW>
+        end
+    
+        for k = 1:size(mergedIntervals,1)-1
+            gk = hours(mergedIntervals(k+1,1) - mergedIntervals(k,2));
+            if gk > 0
+                gapsHr(end+1,1) = gk; %#ok<AGROW>
+            end
+        end
+    
+        gF = hours(tStop - mergedIntervals(end,2));
+        if gF > 0
+            gapsHr(end+1,1) = gF; %#ok<AGROW>
+        end
+    
+        if isempty(gapsHr)
+            gMin = 0;
+            gMax = 0;
+        else
+            gMin = min(gapsHr);
+            gMax = max(gapsHr);
+        end
+    end
+    
+    function s = fmtGap(x)
+        if isnan(x)
+            s = 'NaN';
+        elseif x == 0
+            s = '0';
+        else
+            s = sprintf('%.3f', x);
+        end
+    end
+    
+    %% === Hierarchy plotting helpers ===
+    function plotHierarchyFromDSMCell(scenarioNames, multMap, allElements, DSM_data, orgList, funcList, structList, figTitle)
+        scenarioNames = clean_string(scenarioNames(:));
+        orgList       = clean_string(orgList(:));
+        funcList      = clean_string(funcList(:));
+        structList    = clean_string(structList(:));
+    
+        allElements = clean_string(string(allElements(:)));
+    
+        [tf, idx] = ismember(scenarioNames, allElements);
+        if any(~tf)
+            missing = scenarioNames(~tf);
+            error("Hierarchy plot: scenario elements not found in DSM element list:\n%s", strjoin(missing, "\n"));
+        end
+    
+        isOrg  = ismember(scenarioNames, orgList);
+        isFunc = ismember(scenarioNames, funcList);
+        isStr  = ismember(scenarioNames, structList);
+    
+        unclassified = scenarioNames(~(isOrg|isFunc|isStr));
+        if ~isempty(unclassified)
+            warning("Hierarchy plot: unclassified elements excluded:\n%s", strjoin(unclassified, "\n"));
+        end
+    
+        keep = (isOrg|isFunc|isStr);
+        scenarioNames = scenarioNames(keep);
+        idx           = idx(keep);
+        isOrg         = isOrg(keep);
+        isFunc        = isFunc(keep);
+        isStr         = isStr(keep);
+    
+        src = strings(0,1); dst = strings(0,1);
+        n = numel(scenarioNames);
+    
+        for i = 1:n
+            for j = 1:n
+                if i==j, continue; end
+                entry = DSM_data{idx(i), idx(j)};
+                hasLink = (ischar(entry) && ~isempty(strtrim(entry))) || ...
+                          (isstring(entry) && strlength(strtrim(entry))>0);
+                if ~hasLink, continue; end
+    
+                if isOrg(i) && isFunc(j)
+                    src(end+1,1) = scenarioNames(i); %#ok<AGROW>
+                    dst(end+1,1) = scenarioNames(j); %#ok<AGROW>
+                elseif isFunc(i) && isStr(j)
+                    src(end+1,1) = scenarioNames(i); %#ok<AGROW>
+                    dst(end+1,1) = scenarioNames(j); %#ok<AGROW>
+                elseif isOrg(i) && isStr(j)
+                    src(end+1,1) = scenarioNames(i); %#ok<AGROW>
+                    dst(end+1,1) = scenarioNames(j); %#ok<AGROW>
+                end
+            end
+        end
+    
+        G = digraph(src, dst);
+        if numnodes(G) == 0
+            G = digraph();
+            G = addnode(G, cellstr(scenarioNames));
+        end
+    
+        nodeNames  = string(G.Nodes.Name);
+        nodeLabels = nodeNames;
+    
+        for k = 1:numel(nodeNames)
+            nm = char(nodeNames(k));
+            if ~isempty(multMap) && isKey(multMap, nm)
+                m = multMap(nm);
+                if m > 1
+                    nodeLabels(k) = nodeNames(k) + "  x" + string(m);
+                end
+            end
+        end
+    
+        nodeLabelsWrapped = wrapLabels(cellstr(nodeLabels), 14);
+    
+        orgNodes  = sort(nodeNames(ismember(nodeNames, scenarioNames(isOrg))));
+        funcNodes = sort(nodeNames(ismember(nodeNames, scenarioNames(isFunc))));
+        strNodes  = sort(nodeNames(ismember(nodeNames, scenarioNames(isStr))));
+    
+        X = zeros(numnodes(G),1); Y = zeros(numnodes(G),1);
+        [Xo, Yo] = assignRow(orgNodes,  2.0, G);
+        [Xf, Yf] = assignRow(funcNodes, 1.0, G);
+        [Xs, Ys] = assignRow(strNodes,  0.0, G);
+        X = X + Xo + Xf + Xs;
+        Y = Y + Yo + Yf + Ys;
+    
+        figure('Color','w','Name',char(figTitle), 'Position', [80 80 1700 900]);
+        plot(G, 'XData', X, 'YData', Y, 'NodeLabel', {}, 'ArrowSize', 8, 'LineWidth', 1.0);
+        title(figTitle);
+        axis off;
+    
+        hold on;
+        dx = 0.006; dy = 0.00;
+        for k = 1:numel(nodeLabelsWrapped)
+            text(X(k) + dx, Y(k) + dy, nodeLabelsWrapped{k}, ...
+                'FontSize', 8, 'Color', [0 0 0], 'Interpreter', 'none', ...
+                'HorizontalAlignment', 'left', 'VerticalAlignment', 'middle');
+        end
+        hold off;
+    end
+    
+    function [X, Y] = assignRow(nodeList, yval, G)
+        X = zeros(numnodes(G),1);
+        Y = zeros(numnodes(G),1);
+        if isempty(nodeList), return; end
+        xs = linspace(0.05, 0.95, numel(nodeList));
+        for k = 1:numel(nodeList)
+            idx = find(string(G.Nodes.Name) == nodeList(k), 1);
+            if ~isempty(idx)
+                X(idx) = xs(k);
+                Y(idx) = yval;
+            end
+        end
+    end
+    
+    function out = wrapLabels(lbls, maxChars)
+        out = lbls;
+        for i = 1:numel(lbls)
+            s = char(lbls{i});
+            if length(s) <= maxChars
+                continue;
+            end
+            words = strsplit(s, ' ');
+            lines = "";
+            cur = "";
+            for w = 1:numel(words)
+                if strlength(cur) == 0
+                    trial = string(words{w});
+                else
+                    trial = cur + " " + string(words{w});
+                end
+                if strlength(trial) <= maxChars
+                    cur = trial;
+                else
+                    if strlength(lines) == 0
+                        lines = cur;
+                    else
+                        lines = lines + newline + cur;
+                    end
+                    cur = string(words{w});
+                end
+            end
+            if strlength(cur) > 0
+                if strlength(lines) == 0
+                    lines = cur;
+                else
+                    lines = lines + newline + cur;
+                end
+            end
+            out{i} = char(lines);
+        end
+    end

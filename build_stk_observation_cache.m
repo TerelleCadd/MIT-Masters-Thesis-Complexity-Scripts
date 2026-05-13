@@ -1,0 +1,418 @@
+function stkObs = build_stk_observation_cache(startStr, stopStr, fireLat, fireLon, fireAlt_km, numOrora)
+%BUILD_STK_OBSERVATION_CACHE
+% NOTE: YOU NEED STK12 for this script to work
+% Overall purpose:
+% This function builds a temporary STK scenario to estimate satellite
+% observation windows over a wildfire location. It creates a fire target,
+% adds GOES weather satellites and a user-defined number of OroraTech-like
+% Earth observation satellites, computes when each satellite can see the
+% fire, and stores those access windows in a MATLAB structure.
+%
+% In plain terms:
+% - STK is used to calculate line-of-sight access between satellites and the
+%   fire location.
+% - The resulting access windows are saved into stkObs.
+% - Later scripts can reuse stkObs instead of rebuilding the STK scenario
+%   every time.
+%
+% Inputs:
+% startStr   = scenario start time as an STK-compatible string
+% stopStr    = scenario stop time as an STK-compatible string
+% fireLat    = fire latitude in degrees
+% fireLon    = fire longitude in degrees
+% fireAlt_km = fire altitude in kilometers
+% numOrora   = number of OroraTech-like EO satellites to create
+%
+% Output:
+% stkObs = structure containing:
+%   - start and stop time strings
+%   - weather satellite names
+%   - EO satellite names
+%   - access interval tables for each satellite
+
+    %% ---------------- User plotting toggle ----------------
+    % Set this to true to generate a MATLAB plot of satellite access windows.
+    % Set it to false if you only want to build the cache silently.
+    DO_ACCESS_PLOT = true;
+
+    %% ---------------- Initialize output cache structure ----------------
+    % This structure will store all of the satellite access results.
+    stkObs = struct();
+
+    % Store the scenario start and stop time strings so downstream scripts
+    % know what time interval the cache represents.
+    stkObs.startStr = startStr;
+    stkObs.stopStr  = stopStr;
+
+    % Weather satellites included in every cache.
+    % These are modeled as idealized GEO satellites.
+    stkObs.weatherNames = ["GOES_16","GOES_17","GOES_18"];
+
+    % Create placeholder names for the OroraTech-like EO satellites.
+    stkObs.eoNames = strings(1,numOrora);
+
+    for i = 1:numOrora
+        stkObs.eoNames(i) = "OroraTech_" + i;
+    end
+
+    % Access intervals will be stored as fields in this structure.
+    % Example:
+    %   stkObs.intervals.GOES_16
+    %   stkObs.intervals.OroraTech_1
+    stkObs.intervals = struct();
+
+    %% ---------------- Prepare STK COM connection variables ----------------
+    % app is the STK application object.
+    % root is the main STK automation interface.
+    app = [];
+    root = [];
+
+    try
+        %% ---------------- Start STK through COM automation ----------------
+        % This launches STK 12 and makes it visible.
+        app = actxserver('STK12.Application');
+        app.Visible = true;
+
+        % Personality2 is the main object used to create scenarios, satellites,
+        % facilities, and access calculations.
+        root = app.Personality2;
+
+        % Close any currently open STK scenario so this function starts cleanly.
+        try
+            root.CloseScenario;
+        catch
+            % If no scenario is open, this may throw an error.
+            % That is harmless, so it is ignored.
+        end
+
+        %% ---------------- Create new STK scenario ----------------
+        % Create a scenario specifically for building the observation cache.
+        scenario = root.Children.New('eScenario','Wildfire_STK_ObsCache');
+
+        % Set the scenario time period.
+        scenario.SetTimePeriod(startStr, stopStr);
+        scenario.StartTime = startStr;
+        scenario.StopTime  = stopStr;
+
+        % Reset the animation clock to the beginning of the scenario.
+        root.ExecuteCommand('Animate * Reset');
+
+        %% ---------------- Create the fire location as a facility ----------------
+        % In STK, a Facility is a fixed point on or near Earth.
+        % Here, the wildfire is modeled as a fixed facility.
+        fire = scenario.Children.New('eFacility','Fire_CA');
+        fire.Position.AssignGeodetic(fireLat, fireLon, fireAlt_km);
+
+        %% ---------------- Create GOES weather satellites ----------------
+        % GOES satellites are approximated here as circular geostationary
+        % satellites with longitude-like placement set through the LAN value.
+        %
+        % Each row stores:
+        %   satellite name
+        %   approximate west longitude position in degrees
+        goesData = {
+            'GOES_16', 75.2;
+            'GOES_17', 137.2;
+            'GOES_18', 136.8
+        };
+
+        for i = 1:size(goesData,1)
+            % Create satellite object in STK.
+            sat = scenario.Children.New('eSatellite', goesData{i,1});
+
+            % Convert the satellite initial state into classical orbital
+            % elements so altitude, inclination, RAAN/LAN, and anomaly can be set.
+            kep = sat.Propagator.InitialState.Representation.ConvertTo('eOrbitStateClassical');
+
+            % Use altitude-based size/shape definition.
+            kep.SizeShapeType = 'eSizeShapeAltitude';
+
+            % Use true anomaly for orbital position.
+            kep.LocationType = 'eLocationTrueAnomaly';
+
+            % Use LAN-style ascending node definition.
+            kep.Orientation.AscNodeType = 'eAscNodeLAN';
+
+            % GEO altitude approximation in kilometers.
+            kep.SizeShape.PerigeeAltitude = 35786;
+            kep.SizeShape.ApogeeAltitude  = 35786;
+
+            % Idealized equatorial GEO orbit.
+            kep.Orientation.Inclination  = 0;
+            kep.Orientation.ArgOfPerigee = 0;
+
+            % Convert west longitude convention into STK LAN-style angle.
+            kep.Orientation.AscNode.Value = mod(-goesData{i,2}, 360);
+
+            % Set satellite location along the GEO orbit.
+            kep.Location.Value = 180;
+
+            % Assign the orbital elements and propagate the satellite.
+            sat.Propagator.InitialState.Representation.Assign(kep);
+            sat.Propagator.Propagate;
+        end
+
+        %% ---------------- Create OroraTech-like EO satellites ----------------
+        % These are simplified LEO satellites. They are not exact real TLEs.
+        % The goal is to create an approximate distributed EO constellation
+        % for revisit/access analysis.
+        %
+        % RAAN values are spread evenly around 360 degrees so the satellites
+        % are distributed across orbital planes.
+        RAANs = linspace(0,360,numOrora+1);
+        RAANs(end) = [];
+
+        for i = 1:numOrora
+            satName = sprintf('OroraTech_%d', i);
+
+            % Create satellite object in STK.
+            sat = scenario.Children.New('eSatellite', satName);
+
+            % Use classical orbital elements for the EO satellites.
+            kep = sat.Propagator.InitialState.Representation.ConvertTo('eOrbitStateClassical');
+
+            kep.SizeShapeType = 'eSizeShapeAltitude';
+            kep.LocationType  = 'eLocationTrueAnomaly';
+            kep.Orientation.AscNodeType = 'eAscNodeLAN';
+
+            % Circular 550 km LEO orbit.
+            kep.SizeShape.PerigeeAltitude = 550;
+            kep.SizeShape.ApogeeAltitude  = 550;
+
+            % Near sun-synchronous inclination approximation.
+            kep.Orientation.Inclination = 97;
+
+            % Argument of perigee is arbitrary for circular orbits.
+            kep.Orientation.ArgOfPerigee = 0;
+
+            % Spread satellites by RAAN.
+            kep.Orientation.AscNode.Value = RAANs(i);
+
+            % Start each satellite at true anomaly 0.
+            kep.Location.Value = 0;
+
+            % Assign orbital state and propagate.
+            sat.Propagator.InitialState.Representation.Assign(kep);
+            sat.Propagator.Propagate;
+        end
+
+        %% ---------------- Compute satellite-to-fire access windows ----------------
+        % Combine all satellite names into one list.
+        allNames = [stkObs.weatherNames, stkObs.eoNames];
+
+        for i = 1:numel(allNames)
+            satName = char(allNames(i));
+
+            % Retrieve satellite object from the STK scenario.
+            sat = scenario.Children.Item(satName);
+
+            % Create an access object between the satellite and the fire facility.
+            access = sat.GetAccessToObject(fire);
+
+            % Run STK's access calculation.
+            access.ComputeAccess;
+
+            % Convert STK access results into MATLAB datetime intervals.
+            intervals = get_access_intervals(access, startStr, stopStr);
+
+            % Store intervals under a valid MATLAB structure field name.
+            fld = matlab.lang.makeValidName(satName);
+            stkObs.intervals.(fld) = intervals;
+        end
+
+        %% ---------------- Optional plot of access windows ----------------
+        % This plot helps verify that the cache contains reasonable
+        % observation windows.
+        if DO_ACCESS_PLOT
+            plot_stk_access_windows(stkObs);
+        end
+
+        %% ---------------- Keep STK handles available after function exits ----------------
+        % Assigning these variables to the base workspace keeps STK open.
+        % This is useful for visual inspection and debugging.
+        assignin('base','stkApp',app);
+        assignin('base','stkRoot',root);
+        assignin('base','stkScenario',scenario);
+
+        fprintf('STK handles assigned to base workspace: stkApp, stkRoot, stkScenario\n');
+
+        % If you want STK to close automatically after cache creation,
+        % uncomment the cleanup code below.
+        %
+        % try
+        %     root.CloseScenario;
+        % catch
+        % end
+        %
+        % try
+        %     app.Quit;
+        % catch
+        % end
+        %
+        % try
+        %     delete(app);
+        % catch
+        % end
+
+    catch ME
+        %% ---------------- Error cleanup ----------------
+        % If anything fails, try to close STK cleanly before rethrowing the
+        % original error.
+        try
+            if ~isempty(root)
+                root.CloseScenario;
+            end
+        catch
+        end
+
+        try
+            if ~isempty(app)
+                app.Quit;
+            end
+        catch
+        end
+
+        try
+            if ~isempty(app)
+                delete(app);
+            end
+        catch
+        end
+
+        % Rethrow the original error so the calling script knows what failed.
+        rethrow(ME);
+    end
+end
+
+function intervals = get_access_intervals(accessObj, startStr, stopStr)
+%GET_ACCESS_INTERVALS
+%
+% Overall purpose:
+% This helper reads STK access results and converts them into a MATLAB
+% datetime array.
+%
+% Output:
+% intervals is an N-by-2 datetime array:
+%   column 1 = access start time
+%   column 2 = access stop time
+
+    % Initialize an empty interval array with UTC time zone.
+    intervals = NaT(0,2,'TimeZone','UTC');
+
+    % STK stores access results in the "Access Data" data provider.
+    accessDP = accessObj.DataProviders.Item('Access Data');
+
+    % Execute the data provider over the scenario time range.
+    accessRes = accessDP.Exec(startStr, stopStr);
+
+    % Try to get start and stop times.
+    % If no access windows exist, these datasets may not be available.
+    try
+        startTimesVar = accessRes.DataSets.GetDataSetByName('Start Time').GetValues;
+        stopTimesVar  = accessRes.DataSets.GetDataSetByName('Stop Time').GetValues;
+    catch
+        return;
+    end
+
+    % If STK returns no start times, there are no access intervals.
+    if isempty(startTimesVar)
+        return;
+    end
+
+    % STK may return a single string or a list of strings.
+    % Convert both cases into cell arrays for consistent processing.
+    if ischar(startTimesVar)
+        startTimesCell = {startTimesVar};
+        stopTimesCell  = {stopTimesVar};
+    else
+        startTimesCell = cellstr(startTimesVar);
+        stopTimesCell  = cellstr(stopTimesVar);
+    end
+
+    % Number of access intervals found.
+    nAcc = numel(startTimesCell);
+
+    if nAcc == 0
+        return;
+    end
+
+    % Preallocate start and stop datetime arrays.
+    starts = NaT(nAcc,1,'TimeZone','UTC');
+    stops  = NaT(nAcc,1,'TimeZone','UTC');
+
+    % Convert each STK time string into a MATLAB datetime.
+    for k = 1:nAcc
+        sStr = strtrim(startTimesCell{k});
+        eStr = strtrim(stopTimesCell{k});
+
+        starts(k) = datetime(sStr, ...
+            'InputFormat','d MMM yyyy HH:mm:ss.SSS', ...
+            'TimeZone','UTC');
+
+        stops(k) = datetime(eStr, ...
+            'InputFormat','d MMM yyyy HH:mm:ss.SSS', ...
+            'TimeZone','UTC');
+    end
+
+    % Combine start and stop times into an N-by-2 array.
+    intervals = [starts, stops];
+end
+
+function plot_stk_access_windows(stkObs)
+%PLOT_STK_ACCESS_WINDOWS
+%
+% Overall purpose:
+% This helper plots the access windows stored in stkObs so the user can
+% visually inspect satellite viewing opportunities over the fire location.
+
+    % Combine weather and EO satellite names.
+    allNames = [stkObs.weatherNames, stkObs.eoNames];
+
+    % Number of satellites in the cache.
+    N = numel(allNames);
+
+    % Create a new figure for the access timeline plot.
+    figure('Name','Satellite Access to Fire','NumberTitle','off','Color','w');
+    hold on;
+    grid on;
+
+    % Each satellite is plotted on its own horizontal row.
+    for i = 1:N
+        satName = char(allNames(i));
+        fld = matlab.lang.makeValidName(satName);
+
+        % Skip satellites with no stored interval field.
+        if ~isfield(stkObs.intervals, fld)
+            continue;
+        end
+
+        intervals = stkObs.intervals.(fld);
+
+        % Skip satellites with no access intervals.
+        if isempty(intervals)
+            continue;
+        end
+
+        % Draw each access interval as a thick horizontal line.
+        for k = 1:size(intervals,1)
+            t1 = intervals(k,1);
+            t2 = intervals(k,2);
+
+            plot([t1 t2], [i i], 'LineWidth', 4);
+        end
+    end
+
+    % Format the y-axis so each row is labeled by satellite name.
+    yticks(1:N);
+    yticklabels(allNames);
+
+    % Add labels and title.
+    xlabel('Time (UTC)');
+    ylabel('Satellite');
+    title('View Windows: GOES + OroraTech \rightarrow Fire');
+
+    % Format x-axis dates.
+    datetick('x','dd-mmm HH:MM','keeplimits');
+
+    hold off;
+end
