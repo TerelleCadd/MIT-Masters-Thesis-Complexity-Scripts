@@ -212,6 +212,7 @@ C = C1 + C2 * C3
 - Resolution time
 - Burn burden (area under curve)
 - CO2 emissions
+- Cost
 - Detection delay sensitivity
 
 ---
